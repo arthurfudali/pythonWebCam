@@ -9,39 +9,36 @@ import numpy as np
 import requests
 
 
-# =========================
-# Configurações
-# =========================
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 WINDOW_NAME = "Eye Tracking - Calibracao e Tempo Real"
 
-# Processamento em resolução menor para ganhar FPS
-PROCESS_SCALE = 0.5
+PROCESS_SCALE = 0.65  # mais detalhe para distinguir olhar vertical
 
 API_URL = "http://localhost:8000/gaze"
 SEND_INTERVAL_SEC = 0.10
 REQUEST_TIMEOUT_SEC = 0.6
 
-# Grade 3x3 melhora precisão espacial vs apenas cantos
-CALIBRATION_SECONDS_PER_POINT = 1.6
+# 12 pontos (4x3) => melhor cobertura vertical sem exagerar tempo total
+CALIBRATION_SECONDS_PER_POINT = 1.4
 CALIBRATION_POINTS = [
-    (0.10, 0.10), (0.50, 0.10), (0.90, 0.10),
-    (0.10, 0.50), (0.50, 0.50), (0.90, 0.50),
-    (0.10, 0.90), (0.50, 0.90), (0.90, 0.90),
+    (0.08, 0.10), (0.35, 0.10), (0.65, 0.10), (0.92, 0.10),
+    (0.08, 0.50), (0.35, 0.50), (0.65, 0.50), (0.92, 0.50),
+    (0.08, 0.90), (0.35, 0.90), (0.65, 0.90), (0.92, 0.90),
 ]
-CALIBRATION_COLLECTION_START_RATIO = 0.40
+CALIBRATION_COLLECTION_START_RATIO = 0.35
 
-SMOOTHING_ALPHA = 0.30
-MIN_VALID_SAMPLES_PER_POINT = 8
+SMOOTHING_ALPHA = 0.22  # baseline smoothing
+VELOCITY_ALPHA_MIN = 0.14
+VELOCITY_ALPHA_MAX = 0.52
+SMOOTHING_DEADZONE_NORM = 0.0035
+
+MIN_VALID_SAMPLES_PER_POINT = 7
 MAX_QUEUE_SIZE = 8
-L2_REG = 1e-3
+L2_REG = 5e-4
+VERTICAL_GAIN = 1.28
 
-
-# =========================
-# Landmarks do MediaPipe
-# =========================
 LEFT_IRIS = [474, 475, 476, 477]
 RIGHT_IRIS = [469, 470, 471, 472]
 
@@ -58,13 +55,12 @@ RIGHT_EYE_BOTTOM = 145
 
 @dataclass
 class EyeFeatures:
-    lx: float
-    ly: float
-    rx: float
-    ry: float
+    gx: float
+    gy: float
+    vergence: float
 
     def as_vector(self) -> np.ndarray:
-        return np.array([self.lx, self.ly, self.rx, self.ry], dtype=np.float32)
+        return np.array([self.gx, self.gy, self.vergence], dtype=np.float32)
 
 
 class AsyncGazeSender:
@@ -113,16 +109,7 @@ def _iris_center(landmarks, iris_ids, frame_w: int, frame_h: int) -> np.ndarray:
     return np.mean(pts, axis=0)
 
 
-def _eye_ratios(
-    landmarks,
-    iris_ids,
-    outer_id,
-    inner_id,
-    top_id,
-    bottom_id,
-    frame_w: int,
-    frame_h: int,
-) -> tuple[float, float] | None:
+def _eye_ratios(landmarks, iris_ids, outer_id, inner_id, top_id, bottom_id, frame_w: int, frame_h: int):
     iris = _iris_center(landmarks, iris_ids, frame_w, frame_h)
     p_outer = _to_px(landmarks[outer_id], frame_w, frame_h)
     p_inner = _to_px(landmarks[inner_id], frame_w, frame_h)
@@ -138,70 +125,49 @@ def _eye_ratios(
 
     x_ratio = float(np.dot(iris - p_inner, horiz_vec) / horiz_den)
     y_ratio = float(np.dot(iris - p_top, vert_vec) / vert_den)
-    if not (-0.6 <= x_ratio <= 1.6 and -0.6 <= y_ratio <= 1.6):
+
+    if not (-0.6 <= x_ratio <= 1.6 and -0.7 <= y_ratio <= 1.7):
         return None
     return x_ratio, y_ratio
 
 
 def extract_eye_features(landmarks, frame_w: int, frame_h: int) -> EyeFeatures | None:
-    left = _eye_ratios(
-        landmarks,
-        LEFT_IRIS,
-        LEFT_EYE_OUTER,
-        LEFT_EYE_INNER,
-        LEFT_EYE_TOP,
-        LEFT_EYE_BOTTOM,
-        frame_w,
-        frame_h,
-    )
-    right = _eye_ratios(
-        landmarks,
-        RIGHT_IRIS,
-        RIGHT_EYE_OUTER,
-        RIGHT_EYE_INNER,
-        RIGHT_EYE_TOP,
-        RIGHT_EYE_BOTTOM,
-        frame_w,
-        frame_h,
-    )
+    left = _eye_ratios(landmarks, LEFT_IRIS, LEFT_EYE_OUTER, LEFT_EYE_INNER, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, frame_w, frame_h)
+    right = _eye_ratios(landmarks, RIGHT_IRIS, RIGHT_EYE_OUTER, RIGHT_EYE_INNER, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, frame_w, frame_h)
     if left is None or right is None:
         return None
-    return EyeFeatures(lx=left[0], ly=left[1], rx=right[0], ry=right[1])
+
+    gx = (left[0] + right[0]) * 0.5
+    gy = (left[1] + right[1]) * 0.5
+    gy = 0.5 + (gy - 0.5) * VERTICAL_GAIN
+    vergence = left[0] - right[0]
+    return EyeFeatures(gx=gx, gy=gy, vergence=vergence)
 
 
-def _poly_features(v4: np.ndarray) -> np.ndarray:
-    lx, ly, rx, ry = [float(x) for x in v4]
-    terms = [
+def _map_features(v: np.ndarray) -> np.ndarray:
+    gx, gy, vg = [float(x) for x in v]
+    return np.array([
         1.0,
-        lx, ly, rx, ry,
-        lx * lx, ly * ly, rx * rx, ry * ry,
-        lx * ly, rx * ry,
-        lx * rx, ly * ry,
-        lx * ry, ly * rx,
-    ]
-    return np.array(terms, dtype=np.float32)
+        gx, gy,
+        gx * gy,
+        gx * gx,
+        gy * gy,
+        vg,
+        vg * gy,
+    ], dtype=np.float32)
 
 
-def fit_polynomial_map(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    # features: (N,4), targets: (N,2)
-    design = np.vstack([_poly_features(v) for v in features])
+def fit_map(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    design = np.vstack([_map_features(v) for v in features])
     xtx = design.T @ design
     reg = L2_REG * np.eye(xtx.shape[0], dtype=np.float32)
-    inv = np.linalg.inv(xtx + reg)
-    weights = inv @ design.T @ targets
-    return weights  # (P,2)
+    weights = np.linalg.solve(xtx + reg, design.T @ targets)
+    return weights
 
 
-def map_with_polynomial(weights: np.ndarray, feat: EyeFeatures) -> tuple[float, float]:
-    vec = _poly_features(feat.as_vector())
-    out = vec @ weights
+def apply_map(weights: np.ndarray, feat: EyeFeatures) -> tuple[float, float]:
+    out = _map_features(feat.as_vector()) @ weights
     return float(out[0]), float(out[1])
-
-
-def draw_target(frame: np.ndarray, x: int, y: int, text: str) -> None:
-    cv2.circle(frame, (x, y), 16, (0, 0, 255), -1)
-    cv2.circle(frame, (x, y), 30, (255, 255, 255), 2)
-    cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def robust_center(samples: list[np.ndarray]) -> np.ndarray:
@@ -209,10 +175,37 @@ def robust_center(samples: list[np.ndarray]) -> np.ndarray:
     med = np.median(arr, axis=0)
     d = np.linalg.norm(arr - med, axis=1)
     mad = np.median(d) + 1e-6
-    filtered = arr[d < (2.8 * mad)]
+    filtered = arr[d < (2.6 * mad)]
     if len(filtered) == 0:
         filtered = arr
     return np.median(filtered, axis=0)
+
+
+def adaptive_smooth(raw_x: float, raw_y: float, prev_x: float | None, prev_y: float | None, w: int, h: int):
+    if prev_x is None or prev_y is None:
+        return raw_x, raw_y
+
+    dx = raw_x - prev_x
+    dy = raw_y - prev_y
+    speed_norm = np.hypot(dx / max(w, 1), dy / max(h, 1))
+
+    alpha = VELOCITY_ALPHA_MIN + min(speed_norm * 8.0, 1.0) * (VELOCITY_ALPHA_MAX - VELOCITY_ALPHA_MIN)
+    alpha = 0.5 * alpha + 0.5 * SMOOTHING_ALPHA
+
+    sx = prev_x + alpha * dx
+    sy = prev_y + alpha * dy
+
+    if abs(sx - prev_x) / max(w, 1) < SMOOTHING_DEADZONE_NORM:
+        sx = prev_x
+    if abs(sy - prev_y) / max(h, 1) < SMOOTHING_DEADZONE_NORM:
+        sy = prev_y
+    return sx, sy
+
+
+def draw_target(frame: np.ndarray, x: int, y: int, text: str) -> None:
+    cv2.circle(frame, (x, y), 14, (0, 0, 255), -1)
+    cv2.circle(frame, (x, y), 28, (255, 255, 255), 2)
+    cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def run() -> None:
@@ -258,8 +251,8 @@ def run() -> None:
             frame = cv2.flip(frame, 1)
             frame_h, frame_w = frame.shape[:2]
 
-            proc_w = max(320, int(frame_w * PROCESS_SCALE))
-            proc_h = max(180, int(frame_h * PROCESS_SCALE))
+            proc_w = max(400, int(frame_w * PROCESS_SCALE))
+            proc_h = max(220, int(frame_h * PROCESS_SCALE))
             proc = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
             rgb = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
             result = face_mesh.process(rgb)
@@ -272,10 +265,9 @@ def run() -> None:
                 tx_norm, ty_norm = CALIBRATION_POINTS[calib_idx]
                 tx = int(tx_norm * frame_w)
                 ty = int(ty_norm * frame_h)
-
                 elapsed = time.time() - calib_started_at
                 countdown = max(0.0, CALIBRATION_SECONDS_PER_POINT - elapsed)
-                draw_target(frame, tx, ty, f"Calibracao {calib_idx+1}/{len(CALIBRATION_POINTS)} ({countdown:.1f}s)")
+                draw_target(frame, tx, ty, f"Calibracao {calib_idx + 1}/{len(CALIBRATION_POINTS)} ({countdown:.1f}s)")
 
                 if feature is not None and elapsed >= (CALIBRATION_SECONDS_PER_POINT * CALIBRATION_COLLECTION_START_RATIO):
                     current_point_samples.append(feature.as_vector())
@@ -292,26 +284,18 @@ def run() -> None:
                     if calib_idx == len(CALIBRATION_POINTS):
                         feats = np.array(calibration_features, dtype=np.float32)
                         tars = np.array(calibration_targets, dtype=np.float32)
-                        if len(feats) >= 6:
-                            map_weights = fit_polynomial_map(feats, tars)
-                        else:
-                            raise RuntimeError("Calibração falhou: amostras insuficientes.")
-
+                        map_weights = fit_map(feats, tars)
             else:
                 cv2.putText(frame, "Tracking ativo (ESC para sair)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
                 if feature is not None and map_weights is not None:
-                    gx, gy = map_with_polynomial(map_weights, feature)
-                    gx = float(np.clip(gx, 0, frame_w - 1))
-                    gy = float(np.clip(gy, 0, frame_h - 1))
+                    raw_x, raw_y = apply_map(map_weights, feature)
+                    raw_x = float(np.clip(raw_x, 0, frame_w - 1))
+                    raw_y = float(np.clip(raw_y, 0, frame_h - 1))
 
-                    if smooth_x is None:
-                        smooth_x, smooth_y = gx, gy
-                    else:
-                        smooth_x = smooth_x + SMOOTHING_ALPHA * (gx - smooth_x)
-                        smooth_y = smooth_y + SMOOTHING_ALPHA * (gy - smooth_y)
+                    smooth_x, smooth_y = adaptive_smooth(raw_x, raw_y, smooth_x, smooth_y, frame_w, frame_h)
 
-                    cv2.circle(frame, (int(smooth_x), int(smooth_y)), 12, (0, 255, 255), -1)
+                    cv2.circle(frame, (int(smooth_x), int(smooth_y)), 11, (0, 255, 255), -1)
                     cv2.putText(frame, f"Gaze: ({int(smooth_x)}, {int(smooth_y)})", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
                     now = time.time()
@@ -323,6 +307,8 @@ def run() -> None:
                                 "y": smooth_y,
                                 "x_norm": smooth_x / frame_w,
                                 "y_norm": smooth_y / frame_h,
+                                "raw_x_norm": raw_x / frame_w,
+                                "raw_y_norm": raw_y / frame_h,
                                 "frame_width": frame_w,
                                 "frame_height": frame_h,
                             }
