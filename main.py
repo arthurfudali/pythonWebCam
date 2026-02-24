@@ -1,166 +1,293 @@
-import cv2  # Biblioteca de visão computacional
-import mediapipe as mp  # Framework capaz de detctar elementos em vídeos e imagens
-import numpy as np  # Biblioteca que realiza operações em arrays multidimensionais
-import pygame # Biblioteca para criar interfaces visuais com manipulaçoes de imagens
-import matplotlib.pyplot as plt  # Biblioteca para criação de gráficos 2D e 3D com visualizações estáticas, animadas e interativas
-from matplotlib.colors import LinearSegmentedColormap  # Classe pra criar paleta de cores personalizadas
-import json  # Biblioteca para armazenamento e manipulação de dados no formato JSON
-from pymongo import MongoClient # Biblioteca que permite a interação entre o Python e o BDNR mongo 
-from datetime import datetime # Biblioteca que fornece classes para manipular data e hora 
-import os  # Biblioteca para interagir com o sistema operacional 
+import time
+from dataclasses import dataclass
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import requests
 
 
-WIDTH, HEIGHT = 1560, 1024  # Tamanho da janela
-GRID_SIZE = 70  # Tamanho de cada cédula do HeatMap
+# =========================
+# Configurações
+# =========================
+CAMERA_INDEX = 0
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+WINDOW_NAME = "Eye Tracking - Calibracao e Tempo Real"
 
-pygame.init()  # Inicialização do PyGame
-screen = pygame.display.set_mode((WIDTH, HEIGHT))  # Define uma janela com as dimensões definidas anteriormente 
-pygame.display.set_caption("Rastreamento Ocular e Heatmap") # Nomeia essa tela 
+API_URL = "http://localhost:8000/gaze"
+SEND_INTERVAL_SEC = 0.10  # frequência de envio para API
+REQUEST_TIMEOUT_SEC = 1.0
 
-# Tenta carregar a imagem do design com as dimensões definidas anteriormente
-try:
-    design_image = pygame.image.load('img.png')  
-    design_image = pygame.transform.scale(design_image, (WIDTH, HEIGHT))  
-except pygame.error as e:
-    print(f"Erro ao carregar a imagem: {e}")  
-    design_image = None  
+CALIBRATION_SECONDS_PER_POINT = 2.0
+CALIBRATION_POINTS = [
+    (0.05, 0.05),  # canto superior esquerdo
+    (0.95, 0.05),  # canto superior direito
+    (0.95, 0.95),  # canto inferior direito
+    (0.05, 0.95),  # canto inferior esquerdo
+]
 
-# Inicializa o MediaPipe e refina os landmarks 
-mp_face_mesh = mp.solutions.face_mesh  
-face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)  
+SMOOTHING_ALPHA = 0.25  # 0 = sem atualização, 1 = sem suavização
 
-# Define os landmarks utilizados para o cálculo do centro da irís 
-RIGHT_IRIS = [469, 470, 471, 472]  
-LEFT_IRIS = [474, 475, 476, 477]  
 
-# Função que calcula a média das coordenadas x e y dos pontos da íris para determinar o centro
-def get_iris_center(landmarks, iris_points):
-    x = np.mean([landmarks[point].x for point in iris_points])  
-    y = np.mean([landmarks[point].y for point in iris_points])  
-    return int(x * WIDTH), int(y * HEIGHT)  
+# =========================
+# Landmarks do MediaPipe
+# =========================
+LEFT_IRIS = [474, 475, 476, 477]
+RIGHT_IRIS = [469, 470, 471, 472]
 
-# Cria a matriz do heatmap, inicialmente preenchida com zeros
-matriz = np.zeros((HEIGHT // GRID_SIZE, WIDTH // GRID_SIZE))  
+LEFT_EYE_OUTER = 263
+LEFT_EYE_INNER = 362
+LEFT_EYE_TOP = 386
+LEFT_EYE_BOTTOM = 374
 
-# Função para salvar a matriz no banco de dados
-def save_matriz_to_db(idUsuario: int, idFase: int, matrizFoco: list, tempoFocoEsperado: float, tempoFoco: float, acertos: int, erros: int, duracao: str = "00:01:00"):
-    # A função .toList(), converte a matriz do mapa em uma lista de listas, ou seja, cada linha da matriz, torna-se uma sub-lista dentro da lista principal.
-    try: 
-        client = MongoClient("mongodb://localhost:27017/")
-        db = client["pi"]
-        collection = db["TestesRastreamentoOcular"]
-        
-        doc = {
-            "idUsuario": idUsuario,
-            "idFase": idFase,
-            "data": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "duracao": duracao,
-            "matrizFoco": matrizFoco.tolist(),
-            "tempoFocoEsperado": tempoFocoEsperado,
-            "tempoFoco": tempoFoco,
-            "acertos": acertos,
-            "erros": erros  
-        }
-        collection.insert_one(doc)
-        print("✅ Dados salvos com sucesso no mongoDB!")
-    except Exception as e:
-        print(f"❌ Erro ao salvar dados: {e}")
-        
-def collect_matriz_json_data():
-    try:
-        client = MongoClient("mongodb://localhost:27017/")
-        db = client["pi"]
-        collection = db["TestesRastreamentoOcular"]
-        
-        # Buscar a matriz mais recente pelo id decrescente
-        resultado = collection.find({}, sort=[("_id", -1)]).limit(3)
-        
-        total_acertos = 0 
-        total_erros = 0 
-        
-        for doc in resultado:
-            acertos = doc.get("acertos", 0)
-            erros = doc.get("erros", 0)
-            total_acertos += acertos
-            total_erros += erros
-            matriz = doc["matrizFoco"]
-            print(f"Matriz Foco: {matriz}")
-            
-        # Exibe o total de acertos e erros no terminal
-        print(f"Total de acertos nos últimos 3 testes: {total_acertos}")
-        print(f"Total de erros nos últimos 3 testes: {total_erros}")
-    except Exception as e:
-        print(f"❌ Erro ao buscar dados no MongoDB: {e}")
+RIGHT_EYE_OUTER = 33
+RIGHT_EYE_INNER = 133
+RIGHT_EYE_TOP = 159
+RIGHT_EYE_BOTTOM = 145
+
+
+@dataclass
+class EyeFeatures:
+    x_ratio: float
+    y_ratio: float
+
+
+def _to_px(landmark, frame_w: int, frame_h: int) -> np.ndarray:
+    return np.array([landmark.x * frame_w, landmark.y * frame_h], dtype=np.float32)
+
+
+def _iris_center(landmarks, iris_ids, frame_w: int, frame_h: int) -> np.ndarray:
+    pts = np.array([_to_px(landmarks[i], frame_w, frame_h) for i in iris_ids], dtype=np.float32)
+    return np.mean(pts, axis=0)
+
+
+def _eye_ratios(
+    landmarks,
+    iris_ids,
+    outer_id,
+    inner_id,
+    top_id,
+    bottom_id,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[float, float] | None:
+    iris = _iris_center(landmarks, iris_ids, frame_w, frame_h)
+    p_outer = _to_px(landmarks[outer_id], frame_w, frame_h)
+    p_inner = _to_px(landmarks[inner_id], frame_w, frame_h)
+    p_top = _to_px(landmarks[top_id], frame_w, frame_h)
+    p_bottom = _to_px(landmarks[bottom_id], frame_w, frame_h)
+
+    horiz_vec = p_outer - p_inner
+    vert_vec = p_bottom - p_top
+
+    horiz_den = np.dot(horiz_vec, horiz_vec)
+    vert_den = np.dot(vert_vec, vert_vec)
+
+    if horiz_den < 1e-6 or vert_den < 1e-6:
         return None
 
+    x_ratio = float(np.dot(iris - p_inner, horiz_vec) / horiz_den)
+    y_ratio = float(np.dot(iris - p_top, vert_vec) / vert_den)
+    return x_ratio, y_ratio
 
-# Inicia a câmera 
-cap = cv2.VideoCapture(0)  
-running = True  
+
+def extract_eye_features(landmarks, frame_w: int, frame_h: int) -> EyeFeatures | None:
+    left = _eye_ratios(
+        landmarks,
+        LEFT_IRIS,
+        LEFT_EYE_OUTER,
+        LEFT_EYE_INNER,
+        LEFT_EYE_TOP,
+        LEFT_EYE_BOTTOM,
+        frame_w,
+        frame_h,
+    )
+    right = _eye_ratios(
+        landmarks,
+        RIGHT_IRIS,
+        RIGHT_EYE_OUTER,
+        RIGHT_EYE_INNER,
+        RIGHT_EYE_TOP,
+        RIGHT_EYE_BOTTOM,
+        frame_w,
+        frame_h,
+    )
+
+    if left is None or right is None:
+        return None
+
+    return EyeFeatures(
+        x_ratio=(left[0] + right[0]) / 2.0,
+        y_ratio=(left[1] + right[1]) / 2.0,
+    )
 
 
-while cap.isOpened() and running:  
-    success, frame = cap.read()  
-    if not success:  
-        break
+def fit_affine(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    # features: (N, 2) ; targets: (N, 2)
+    # x = a0*fx + a1*fy + a2
+    # y = b0*fx + b1*fy + b2
+    n = features.shape[0]
+    design = np.hstack([features, np.ones((n, 1), dtype=np.float32)])
+    params, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
+    return params  # shape (3,2)
 
-    # Espelha a imagem
-    frame = cv2.flip(frame, 1)  
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  
-    results = face_mesh.process(rgb_frame) 
-    
-    if design_image:
-        screen.blit(design_image, (0, 0)) 
 
-    # Para cada rosto detectado no frame:
-    if results.multi_face_landmarks:  
-        for face_landmarks in results.multi_face_landmarks:  
-            # Calcula o centro da irís do olho direito e esquerdo através da função criada anteriormente
-            right_iris_center = get_iris_center(face_landmarks.landmark, RIGHT_IRIS)  
-            left_iris_center = get_iris_center(face_landmarks.landmark, LEFT_IRIS)  
-            
-            # Faz a média do centro da irís direita e esquerda, para ser somente um ponto representando os olhos
-            iris_x = int((right_iris_center[0] + left_iris_center[0]) / 2)
-            iris_y = int((right_iris_center[1] + left_iris_center[1]) / 2)
+def map_with_affine(params: np.ndarray, feat: EyeFeatures) -> tuple[float, float]:
+    p = np.array([feat.x_ratio, feat.y_ratio, 1.0], dtype=np.float32)
+    out = p @ params
+    return float(out[0]), float(out[1])
 
-            # Converte o centro aproximado do olhar para um grid específico no mapa
-            grid_x = iris_x // GRID_SIZE  
-            grid_y = iris_y // GRID_SIZE  
 
-            # Verifica se o olhar mapeado pra tela está dentro do heatmap pra evitar erros 
-            if 0 <= grid_x < matriz.shape[1] and 0 <= grid_y < matriz.shape[0]:
-                # Incrementa o valor de cada cédula
-                matriz[grid_y, grid_x] += 1  
+def post_gaze(api_url: str, x: float, y: float, frame_w: int, frame_h: int) -> None:
+    payload = {
+        "timestamp": time.time(),
+        "x": x,
+        "y": y,
+        "x_norm": x / frame_w,
+        "y_norm": y / frame_h,
+        "frame_width": frame_w,
+        "frame_height": frame_h,
+    }
+    try:
+        requests.post(api_url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
+    except requests.RequestException:
+        # Falha de rede/API não deve interromper o tracking
+        pass
 
-    # Permite fechar a janela do pygame e encerrar o rastreamento ocular quando eu clico pra sair
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:  
-            running = False  
 
-    # Atualiza a tela com as novas mudanças.
-    pygame.display.flip()  
+def draw_target(frame: np.ndarray, x: int, y: int, text: str) -> None:
+    cv2.circle(frame, (x, y), 16, (0, 0, 255), -1)
+    cv2.circle(frame, (x, y), 30, (255, 255, 255), 2)
+    cv2.putText(
+        frame,
+        text,
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
-# Libera o recuso da câmera 
-cap.release()  
 
-# Chamada da função pra salvar a matriz no mongo
-save_matriz_to_db(
-    idUsuario=1,
-    idFase=1,
-    matrizFoco=matriz, 
-    tempoFocoEsperado=0.3,
-    tempoFoco=0.3,
-    acertos=5,
-    erros=2
-)
-collect_matriz_json_data()
+def run() -> None:
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
-# Fechamento das janelas 
-waiting = True
-while waiting:
-    for event in pygame.event.get():  
-        if event.type == pygame.QUIT:  
-            waiting = False  
+    if not cap.isOpened():
+        raise RuntimeError("Não foi possível abrir a câmera.")
 
-pygame.quit()  
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
 
+    calibration_features: list[list[float]] = []
+    calibration_targets: list[list[float]] = []
+
+    calib_idx = 0
+    calib_started_at = time.time()
+    affine_params = None
+
+    smooth_x, smooth_y = None, None
+    last_send = 0.0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        frame = cv2.flip(frame, 1)
+        frame_h, frame_w = frame.shape[:2]
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = face_mesh.process(rgb)
+
+        feature = None
+        if result.multi_face_landmarks:
+            feature = extract_eye_features(result.multi_face_landmarks[0].landmark, frame_w, frame_h)
+
+        # Etapa 1: calibração
+        if calib_idx < len(CALIBRATION_POINTS):
+            tx_norm, ty_norm = CALIBRATION_POINTS[calib_idx]
+            tx = int(tx_norm * frame_w)
+            ty = int(ty_norm * frame_h)
+
+            elapsed = time.time() - calib_started_at
+            countdown = max(0.0, CALIBRATION_SECONDS_PER_POINT - elapsed)
+            draw_target(frame, tx, ty, f"Calibracao {calib_idx+1}/{len(CALIBRATION_POINTS)} - olhe para o ponto ({countdown:.1f}s)")
+
+            if feature is not None:
+                calibration_features.append([feature.x_ratio, feature.y_ratio])
+                calibration_targets.append([tx, ty])
+
+            if elapsed >= CALIBRATION_SECONDS_PER_POINT:
+                calib_idx += 1
+                calib_started_at = time.time()
+
+                if calib_idx == len(CALIBRATION_POINTS):
+                    feats = np.array(calibration_features, dtype=np.float32)
+                    tars = np.array(calibration_targets, dtype=np.float32)
+                    if len(feats) >= 4:
+                        affine_params = fit_affine(feats, tars)
+                    else:
+                        raise RuntimeError("Calibração falhou: amostras insuficientes.")
+
+        # Etapa 2: tracking em tempo real + envio API
+        else:
+            cv2.putText(
+                frame,
+                "Tracking ativo (ESC para sair)",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+            if feature is not None and affine_params is not None:
+                gx, gy = map_with_affine(affine_params, feature)
+                gx = float(np.clip(gx, 0, frame_w - 1))
+                gy = float(np.clip(gy, 0, frame_h - 1))
+
+                if smooth_x is None:
+                    smooth_x, smooth_y = gx, gy
+                else:
+                    smooth_x = smooth_x + SMOOTHING_ALPHA * (gx - smooth_x)
+                    smooth_y = smooth_y + SMOOTHING_ALPHA * (gy - smooth_y)
+
+                cv2.circle(frame, (int(smooth_x), int(smooth_y)), 12, (0, 255, 255), -1)
+                cv2.putText(
+                    frame,
+                    f"Gaze: ({int(smooth_x)}, {int(smooth_y)})",
+                    (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                now = time.time()
+                if now - last_send >= SEND_INTERVAL_SEC:
+                    post_gaze(API_URL, smooth_x, smooth_y, frame_w, frame_h)
+                    last_send = now
+
+        cv2.imshow(WINDOW_NAME, frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    run()
