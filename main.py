@@ -18,25 +18,25 @@ CAMERA_HEIGHT = 720
 WINDOW_NAME = "Eye Tracking - Calibracao e Tempo Real"
 
 # Processamento em resolução menor para ganhar FPS
-PROCESS_SCALE = 0.5  # 0.5 = processa em 640x360 quando câmera é 1280x720
+PROCESS_SCALE = 0.5
 
 API_URL = "http://localhost:8000/gaze"
 SEND_INTERVAL_SEC = 0.10
 REQUEST_TIMEOUT_SEC = 0.6
 
-CALIBRATION_SECONDS_PER_POINT = 2.2
+# Grade 3x3 melhora precisão espacial vs apenas cantos
+CALIBRATION_SECONDS_PER_POINT = 1.6
 CALIBRATION_POINTS = [
-    (0.05, 0.05),
-    (0.95, 0.05),
-    (0.95, 0.95),
-    (0.05, 0.95),
-    (0.50, 0.50),  # ponto central para melhorar precisão global
+    (0.10, 0.10), (0.50, 0.10), (0.90, 0.10),
+    (0.10, 0.50), (0.50, 0.50), (0.90, 0.50),
+    (0.10, 0.90), (0.50, 0.90), (0.90, 0.90),
 ]
-CALIBRATION_COLLECTION_START_RATIO = 0.45  # ignora início do ponto (tempo de movimento ocular)
+CALIBRATION_COLLECTION_START_RATIO = 0.40
 
-SMOOTHING_ALPHA = 0.35
-MIN_VALID_SAMPLES_PER_POINT = 10
+SMOOTHING_ALPHA = 0.30
+MIN_VALID_SAMPLES_PER_POINT = 8
 MAX_QUEUE_SIZE = 8
+L2_REG = 1e-3
 
 
 # =========================
@@ -58,8 +58,13 @@ RIGHT_EYE_BOTTOM = 145
 
 @dataclass
 class EyeFeatures:
-    x_ratio: float
-    y_ratio: float
+    lx: float
+    ly: float
+    rx: float
+    ry: float
+
+    def as_vector(self) -> np.ndarray:
+        return np.array([self.lx, self.ly, self.rx, self.ry], dtype=np.float32)
 
 
 class AsyncGazeSender:
@@ -74,7 +79,7 @@ class AsyncGazeSender:
     def send(self, payload: dict) -> None:
         if self._q.full():
             try:
-                self._q.get_nowait()  # descarta payload antigo para manter baixa latência
+                self._q.get_nowait()
             except queue.Empty:
                 pass
         try:
@@ -126,19 +131,15 @@ def _eye_ratios(
 
     horiz_vec = p_outer - p_inner
     vert_vec = p_bottom - p_top
-
     horiz_den = np.dot(horiz_vec, horiz_vec)
     vert_den = np.dot(vert_vec, vert_vec)
-
     if horiz_den < 1e-6 or vert_den < 1e-6:
         return None
 
     x_ratio = float(np.dot(iris - p_inner, horiz_vec) / horiz_den)
     y_ratio = float(np.dot(iris - p_top, vert_vec) / vert_den)
-
     if not (-0.6 <= x_ratio <= 1.6 and -0.6 <= y_ratio <= 1.6):
         return None
-
     return x_ratio, y_ratio
 
 
@@ -163,26 +164,37 @@ def extract_eye_features(landmarks, frame_w: int, frame_h: int) -> EyeFeatures |
         frame_w,
         frame_h,
     )
-
     if left is None or right is None:
         return None
-
-    return EyeFeatures(
-        x_ratio=(left[0] + right[0]) / 2.0,
-        y_ratio=(left[1] + right[1]) / 2.0,
-    )
+    return EyeFeatures(lx=left[0], ly=left[1], rx=right[0], ry=right[1])
 
 
-def fit_affine(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    n = features.shape[0]
-    design = np.hstack([features, np.ones((n, 1), dtype=np.float32)])
-    params, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
-    return params
+def _poly_features(v4: np.ndarray) -> np.ndarray:
+    lx, ly, rx, ry = [float(x) for x in v4]
+    terms = [
+        1.0,
+        lx, ly, rx, ry,
+        lx * lx, ly * ly, rx * rx, ry * ry,
+        lx * ly, rx * ry,
+        lx * rx, ly * ry,
+        lx * ry, ly * rx,
+    ]
+    return np.array(terms, dtype=np.float32)
 
 
-def map_with_affine(params: np.ndarray, feat: EyeFeatures) -> tuple[float, float]:
-    p = np.array([feat.x_ratio, feat.y_ratio, 1.0], dtype=np.float32)
-    out = p @ params
+def fit_polynomial_map(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    # features: (N,4), targets: (N,2)
+    design = np.vstack([_poly_features(v) for v in features])
+    xtx = design.T @ design
+    reg = L2_REG * np.eye(xtx.shape[0], dtype=np.float32)
+    inv = np.linalg.inv(xtx + reg)
+    weights = inv @ design.T @ targets
+    return weights  # (P,2)
+
+
+def map_with_polynomial(weights: np.ndarray, feat: EyeFeatures) -> tuple[float, float]:
+    vec = _poly_features(feat.as_vector())
+    out = vec @ weights
     return float(out[0]), float(out[1])
 
 
@@ -192,7 +204,7 @@ def draw_target(frame: np.ndarray, x: int, y: int, text: str) -> None:
     cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def robust_center(samples: list[list[float]]) -> list[float]:
+def robust_center(samples: list[np.ndarray]) -> np.ndarray:
     arr = np.array(samples, dtype=np.float32)
     med = np.median(arr, axis=0)
     d = np.linalg.norm(arr - med, axis=1)
@@ -200,8 +212,7 @@ def robust_center(samples: list[list[float]]) -> list[float]:
     filtered = arr[d < (2.8 * mad)]
     if len(filtered) == 0:
         filtered = arr
-    out = np.median(filtered, axis=0)
-    return [float(out[0]), float(out[1])]
+    return np.median(filtered, axis=0)
 
 
 def run() -> None:
@@ -222,13 +233,13 @@ def run() -> None:
         min_tracking_confidence=0.6,
     )
 
-    calibration_features: list[list[float]] = []
+    calibration_features: list[np.ndarray] = []
     calibration_targets: list[list[float]] = []
-    current_point_samples: list[list[float]] = []
+    current_point_samples: list[np.ndarray] = []
 
     calib_idx = 0
     calib_started_at = time.time()
-    affine_params = None
+    map_weights = None
 
     smooth_x, smooth_y = None, None
     last_send = 0.0
@@ -267,36 +278,30 @@ def run() -> None:
                 draw_target(frame, tx, ty, f"Calibracao {calib_idx+1}/{len(CALIBRATION_POINTS)} ({countdown:.1f}s)")
 
                 if feature is not None and elapsed >= (CALIBRATION_SECONDS_PER_POINT * CALIBRATION_COLLECTION_START_RATIO):
-                    current_point_samples.append([feature.x_ratio, feature.y_ratio])
+                    current_point_samples.append(feature.as_vector())
 
                 if elapsed >= CALIBRATION_SECONDS_PER_POINT:
                     if len(current_point_samples) >= MIN_VALID_SAMPLES_PER_POINT:
                         point_feat = robust_center(current_point_samples)
                         calibration_features.append(point_feat)
                         calibration_targets.append([tx, ty])
-                    else:
-                        # repete o mesmo ponto se amostra foi ruim
-                        calib_started_at = time.time()
-                        current_point_samples = []
-                        continue
-
+                        calib_idx += 1
                     current_point_samples = []
-                    calib_idx += 1
                     calib_started_at = time.time()
 
                     if calib_idx == len(CALIBRATION_POINTS):
                         feats = np.array(calibration_features, dtype=np.float32)
                         tars = np.array(calibration_targets, dtype=np.float32)
-                        if len(feats) >= 4:
-                            affine_params = fit_affine(feats, tars)
+                        if len(feats) >= 6:
+                            map_weights = fit_polynomial_map(feats, tars)
                         else:
                             raise RuntimeError("Calibração falhou: amostras insuficientes.")
 
             else:
                 cv2.putText(frame, "Tracking ativo (ESC para sair)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-                if feature is not None and affine_params is not None:
-                    gx, gy = map_with_affine(affine_params, feature)
+                if feature is not None and map_weights is not None:
+                    gx, gy = map_with_polynomial(map_weights, feature)
                     gx = float(np.clip(gx, 0, frame_w - 1))
                     gy = float(np.clip(gy, 0, frame_h - 1))
 
