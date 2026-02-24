@@ -1,14 +1,13 @@
-# 👁️ Eye Tracking em tempo real com calibração
+# 👁️ Eye Tracking em tempo real (Fullscreen 1920x1080)
 
-Projeto de rastreamento ocular em **tempo real** com foco em FPS e precisão, especialmente no eixo vertical (olhar para cima/baixo).
+Pipeline de rastreamento ocular em tempo real com foco em **estabilidade visual** e calibração robusta.
 
-## Melhorias desta versão
-- Calibração em **grade 4x3 (12 pontos)** para aumentar cobertura vertical e horizontal.
-- Mapeamento com modelo compacto regularizado (evita overfitting).
-- Feature explícita de **vergência** (diferença entre olhos) para ajudar desacoplar olhar de movimento de cabeça.
-- Ganho vertical (`VERTICAL_GAIN`) para melhorar sensibilidade de cima/baixo.
-- Suavização adaptativa por velocidade + deadzone para reduzir tremor sem perder resposta.
-- Payload inclui coordenadas suavizadas e brutas normalizadas.
+## O que foi melhorado
+- Execução em **fullscreen 1920x1080**.
+- Calibração em **15 pontos (grade 5x3)** para maior robustez.
+- Mapeamento regularizado para reduzir overfitting.
+- Filtro temporal adaptativo + deadzone + snap grid (margem de erro controlada) para reduzir tremor.
+- Envio assíncrono para API, mantendo FPS alto.
 
 ## Dependências
 ```bash
@@ -16,25 +15,26 @@ pip install opencv-python mediapipe numpy requests
 ```
 
 ## Como executar
-1. Ajuste `API_URL` no `main.py`.
-2. Rode:
-   ```bash
-   python main.py
-   ```
-3. Durante a calibração, mantenha a cabeça parada e mova apenas os olhos.
-4. Pressione `ESC` para encerrar.
+```bash
+python main.py
+```
 
-## Payload enviado para API
+Durante a calibração:
+- mantenha a cabeça o mais estável possível;
+- olhe para o ponto vermelho até ele avançar;
+- use ambiente bem iluminado.
+
+## Payload enviado
 ```json
 {
   "timestamp": 1710000000.12,
-  "x": 640.5,
-  "y": 300.2,
-  "x_norm": 0.500,
-  "y_norm": 0.417,
-  "raw_x_norm": 0.492,
-  "raw_y_norm": 0.431,
-  "frame_width": 1280,
-  "frame_height": 720
+  "x": 962.0,
+  "y": 514.0,
+  "x_norm": 0.501,
+  "y_norm": 0.476,
+  "raw_x_norm": 0.493,
+  "raw_y_norm": 0.488,
+  "frame_width": 1920,
+  "frame_height": 1080
 }
 ```
