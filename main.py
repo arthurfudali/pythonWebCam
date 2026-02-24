@@ -1,3 +1,5 @@
+import queue
+import threading
 import time
 from dataclasses import dataclass
 
@@ -15,19 +17,26 @@ CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 WINDOW_NAME = "Eye Tracking - Calibracao e Tempo Real"
 
+# Processamento em resolução menor para ganhar FPS
+PROCESS_SCALE = 0.5  # 0.5 = processa em 640x360 quando câmera é 1280x720
+
 API_URL = "http://localhost:8000/gaze"
-SEND_INTERVAL_SEC = 0.10  # frequência de envio para API
-REQUEST_TIMEOUT_SEC = 1.0
+SEND_INTERVAL_SEC = 0.10
+REQUEST_TIMEOUT_SEC = 0.6
 
-CALIBRATION_SECONDS_PER_POINT = 2.0
+CALIBRATION_SECONDS_PER_POINT = 2.2
 CALIBRATION_POINTS = [
-    (0.05, 0.05),  # canto superior esquerdo
-    (0.95, 0.05),  # canto superior direito
-    (0.95, 0.95),  # canto inferior direito
-    (0.05, 0.95),  # canto inferior esquerdo
+    (0.05, 0.05),
+    (0.95, 0.05),
+    (0.95, 0.95),
+    (0.05, 0.95),
+    (0.50, 0.50),  # ponto central para melhorar precisão global
 ]
+CALIBRATION_COLLECTION_START_RATIO = 0.45  # ignora início do ponto (tempo de movimento ocular)
 
-SMOOTHING_ALPHA = 0.25  # 0 = sem atualização, 1 = sem suavização
+SMOOTHING_ALPHA = 0.35
+MIN_VALID_SAMPLES_PER_POINT = 10
+MAX_QUEUE_SIZE = 8
 
 
 # =========================
@@ -51,6 +60,43 @@ RIGHT_EYE_BOTTOM = 145
 class EyeFeatures:
     x_ratio: float
     y_ratio: float
+
+
+class AsyncGazeSender:
+    def __init__(self, api_url: str):
+        self.api_url = api_url
+        self._q: queue.Queue[dict] = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._session = requests.Session()
+        self._thread.start()
+
+    def send(self, payload: dict) -> None:
+        if self._q.full():
+            try:
+                self._q.get_nowait()  # descarta payload antigo para manter baixa latência
+            except queue.Empty:
+                pass
+        try:
+            self._q.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._session.close()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set() or not self._q.empty():
+            try:
+                payload = self._q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._session.post(self.api_url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
+            except requests.RequestException:
+                pass
 
 
 def _to_px(landmark, frame_w: int, frame_h: int) -> np.ndarray:
@@ -89,6 +135,10 @@ def _eye_ratios(
 
     x_ratio = float(np.dot(iris - p_inner, horiz_vec) / horiz_den)
     y_ratio = float(np.dot(iris - p_top, vert_vec) / vert_den)
+
+    if not (-0.6 <= x_ratio <= 1.6 and -0.6 <= y_ratio <= 1.6):
+        return None
+
     return x_ratio, y_ratio
 
 
@@ -124,13 +174,10 @@ def extract_eye_features(landmarks, frame_w: int, frame_h: int) -> EyeFeatures |
 
 
 def fit_affine(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    # features: (N, 2) ; targets: (N, 2)
-    # x = a0*fx + a1*fy + a2
-    # y = b0*fx + b1*fy + b2
     n = features.shape[0]
     design = np.hstack([features, np.ones((n, 1), dtype=np.float32)])
     params, _, _, _ = np.linalg.lstsq(design, targets, rcond=None)
-    return params  # shape (3,2)
+    return params
 
 
 def map_with_affine(params: np.ndarray, feat: EyeFeatures) -> tuple[float, float]:
@@ -139,42 +186,29 @@ def map_with_affine(params: np.ndarray, feat: EyeFeatures) -> tuple[float, float
     return float(out[0]), float(out[1])
 
 
-def post_gaze(api_url: str, x: float, y: float, frame_w: int, frame_h: int) -> None:
-    payload = {
-        "timestamp": time.time(),
-        "x": x,
-        "y": y,
-        "x_norm": x / frame_w,
-        "y_norm": y / frame_h,
-        "frame_width": frame_w,
-        "frame_height": frame_h,
-    }
-    try:
-        requests.post(api_url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
-    except requests.RequestException:
-        # Falha de rede/API não deve interromper o tracking
-        pass
-
-
 def draw_target(frame: np.ndarray, x: int, y: int, text: str) -> None:
     cv2.circle(frame, (x, y), 16, (0, 0, 255), -1)
     cv2.circle(frame, (x, y), 30, (255, 255, 255), 2)
-    cv2.putText(
-        frame,
-        text,
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
+    cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def robust_center(samples: list[list[float]]) -> list[float]:
+    arr = np.array(samples, dtype=np.float32)
+    med = np.median(arr, axis=0)
+    d = np.linalg.norm(arr - med, axis=1)
+    mad = np.median(d) + 1e-6
+    filtered = arr[d < (2.8 * mad)]
+    if len(filtered) == 0:
+        filtered = arr
+    out = np.median(filtered, axis=0)
+    return [float(out[0]), float(out[1])]
 
 
 def run() -> None:
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
         raise RuntimeError("Não foi possível abrir a câmera.")
@@ -185,11 +219,12 @@ def run() -> None:
         max_num_faces=1,
         refine_landmarks=True,
         min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_tracking_confidence=0.6,
     )
 
     calibration_features: list[list[float]] = []
     calibration_targets: list[list[float]] = []
+    current_point_samples: list[list[float]] = []
 
     calib_idx = 0
     calib_started_at = time.time()
@@ -197,96 +232,115 @@ def run() -> None:
 
     smooth_x, smooth_y = None, None
     last_send = 0.0
+    sender = AsyncGazeSender(API_URL)
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    frame_count = 0
+    fps_clock = time.time()
+    fps_value = 0.0
 
-        frame = cv2.flip(frame, 1)
-        frame_h, frame_w = frame.shape[:2]
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = face_mesh.process(rgb)
+            frame = cv2.flip(frame, 1)
+            frame_h, frame_w = frame.shape[:2]
 
-        feature = None
-        if result.multi_face_landmarks:
-            feature = extract_eye_features(result.multi_face_landmarks[0].landmark, frame_w, frame_h)
+            proc_w = max(320, int(frame_w * PROCESS_SCALE))
+            proc_h = max(180, int(frame_h * PROCESS_SCALE))
+            proc = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_LINEAR)
+            rgb = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
+            result = face_mesh.process(rgb)
 
-        # Etapa 1: calibração
-        if calib_idx < len(CALIBRATION_POINTS):
-            tx_norm, ty_norm = CALIBRATION_POINTS[calib_idx]
-            tx = int(tx_norm * frame_w)
-            ty = int(ty_norm * frame_h)
+            feature = None
+            if result.multi_face_landmarks:
+                feature = extract_eye_features(result.multi_face_landmarks[0].landmark, proc_w, proc_h)
 
-            elapsed = time.time() - calib_started_at
-            countdown = max(0.0, CALIBRATION_SECONDS_PER_POINT - elapsed)
-            draw_target(frame, tx, ty, f"Calibracao {calib_idx+1}/{len(CALIBRATION_POINTS)} - olhe para o ponto ({countdown:.1f}s)")
+            if calib_idx < len(CALIBRATION_POINTS):
+                tx_norm, ty_norm = CALIBRATION_POINTS[calib_idx]
+                tx = int(tx_norm * frame_w)
+                ty = int(ty_norm * frame_h)
 
-            if feature is not None:
-                calibration_features.append([feature.x_ratio, feature.y_ratio])
-                calibration_targets.append([tx, ty])
+                elapsed = time.time() - calib_started_at
+                countdown = max(0.0, CALIBRATION_SECONDS_PER_POINT - elapsed)
+                draw_target(frame, tx, ty, f"Calibracao {calib_idx+1}/{len(CALIBRATION_POINTS)} ({countdown:.1f}s)")
 
-            if elapsed >= CALIBRATION_SECONDS_PER_POINT:
-                calib_idx += 1
-                calib_started_at = time.time()
+                if feature is not None and elapsed >= (CALIBRATION_SECONDS_PER_POINT * CALIBRATION_COLLECTION_START_RATIO):
+                    current_point_samples.append([feature.x_ratio, feature.y_ratio])
 
-                if calib_idx == len(CALIBRATION_POINTS):
-                    feats = np.array(calibration_features, dtype=np.float32)
-                    tars = np.array(calibration_targets, dtype=np.float32)
-                    if len(feats) >= 4:
-                        affine_params = fit_affine(feats, tars)
+                if elapsed >= CALIBRATION_SECONDS_PER_POINT:
+                    if len(current_point_samples) >= MIN_VALID_SAMPLES_PER_POINT:
+                        point_feat = robust_center(current_point_samples)
+                        calibration_features.append(point_feat)
+                        calibration_targets.append([tx, ty])
                     else:
-                        raise RuntimeError("Calibração falhou: amostras insuficientes.")
+                        # repete o mesmo ponto se amostra foi ruim
+                        calib_started_at = time.time()
+                        current_point_samples = []
+                        continue
 
-        # Etapa 2: tracking em tempo real + envio API
-        else:
-            cv2.putText(
-                frame,
-                "Tracking ativo (ESC para sair)",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+                    current_point_samples = []
+                    calib_idx += 1
+                    calib_started_at = time.time()
 
-            if feature is not None and affine_params is not None:
-                gx, gy = map_with_affine(affine_params, feature)
-                gx = float(np.clip(gx, 0, frame_w - 1))
-                gy = float(np.clip(gy, 0, frame_h - 1))
+                    if calib_idx == len(CALIBRATION_POINTS):
+                        feats = np.array(calibration_features, dtype=np.float32)
+                        tars = np.array(calibration_targets, dtype=np.float32)
+                        if len(feats) >= 4:
+                            affine_params = fit_affine(feats, tars)
+                        else:
+                            raise RuntimeError("Calibração falhou: amostras insuficientes.")
 
-                if smooth_x is None:
-                    smooth_x, smooth_y = gx, gy
-                else:
-                    smooth_x = smooth_x + SMOOTHING_ALPHA * (gx - smooth_x)
-                    smooth_y = smooth_y + SMOOTHING_ALPHA * (gy - smooth_y)
+            else:
+                cv2.putText(frame, "Tracking ativo (ESC para sair)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-                cv2.circle(frame, (int(smooth_x), int(smooth_y)), 12, (0, 255, 255), -1)
-                cv2.putText(
-                    frame,
-                    f"Gaze: ({int(smooth_x)}, {int(smooth_y)})",
-                    (20, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+                if feature is not None and affine_params is not None:
+                    gx, gy = map_with_affine(affine_params, feature)
+                    gx = float(np.clip(gx, 0, frame_w - 1))
+                    gy = float(np.clip(gy, 0, frame_h - 1))
 
-                now = time.time()
-                if now - last_send >= SEND_INTERVAL_SEC:
-                    post_gaze(API_URL, smooth_x, smooth_y, frame_w, frame_h)
-                    last_send = now
+                    if smooth_x is None:
+                        smooth_x, smooth_y = gx, gy
+                    else:
+                        smooth_x = smooth_x + SMOOTHING_ALPHA * (gx - smooth_x)
+                        smooth_y = smooth_y + SMOOTHING_ALPHA * (gy - smooth_y)
 
-        cv2.imshow(WINDOW_NAME, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC
-            break
+                    cv2.circle(frame, (int(smooth_x), int(smooth_y)), 12, (0, 255, 255), -1)
+                    cv2.putText(frame, f"Gaze: ({int(smooth_x)}, {int(smooth_y)})", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-    cap.release()
-    cv2.destroyAllWindows()
+                    now = time.time()
+                    if now - last_send >= SEND_INTERVAL_SEC:
+                        sender.send(
+                            {
+                                "timestamp": now,
+                                "x": smooth_x,
+                                "y": smooth_y,
+                                "x_norm": smooth_x / frame_w,
+                                "y_norm": smooth_y / frame_h,
+                                "frame_width": frame_w,
+                                "frame_height": frame_h,
+                            }
+                        )
+                        last_send = now
+
+            frame_count += 1
+            now = time.time()
+            dt = now - fps_clock
+            if dt >= 0.5:
+                fps_value = frame_count / dt
+                frame_count = 0
+                fps_clock = now
+            cv2.putText(frame, f"FPS: {fps_value:.1f}", (20, frame_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+            cv2.imshow(WINDOW_NAME, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                break
+    finally:
+        sender.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
